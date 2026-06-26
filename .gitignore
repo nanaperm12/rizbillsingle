@@ -1,0 +1,48 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+*.zip
+dist
+dist-ssr
+*.local
+.expo/
+.env
+/isp-billing-management-system-rev*/
+backend/uploads/
+backend/whatsapp_session/
+backend/landingpage/img.zip
+backend/services copy.js
+backend/tripayService copy.js
+backend/backfillCashMutations copy.js
+backend/.env
+130
+Catatn revisi.txt
+PlnForm-numbered.txt
+_fix.py
+oidc300c320.txt
+out.txt
+package.json.produc.txt
+script.py
+script.txt
+show.js
+tmp.py
+walk.txt
+bahan referensi olt.js
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

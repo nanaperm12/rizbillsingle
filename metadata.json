@@ -1,0 +1,8 @@
+{
+  "name": "RIZKITECH BILL | ISP Billing and Customer Management System",
+  "description": "A comprehensive dashboard for managing ISP customers, billing, payments, and network status. Includes an admin dashboard for overall management and a customer portal for users to view and pay their bills.",
+  "requestFramePermissions": [
+    "geolocation",
+    "camera"
+  ]
+}

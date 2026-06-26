@@ -1,0 +1,51 @@
+# Dependencies
+/node_modules
+/frontendmobil/node_modules
+
+# Build output
+/dist
+
+# Vite cache
+.vite
+
+# Log files
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# Local environment variables
+.env
+.txt
+.env.local
+/backend/.env
+
+# IDE and OS specific
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+.zip
+# Expo / React Native specific
+/frontendmobil/.expo/
+/frontendmobil/web-build/
+
+# Android build output
+/frontendmobil/android/app/build/
+/frontendmobil/android/.gradle/
+/frontendmobil/android/build/
+
+# iOS build output
+/frontendmobil/ios/build/
+/frontendmobil/ios/Pods/
+
+# Backend specific
+/backend/uploads/
+/backend/whatsapp_session/
+*.sql
+
+# TypeScript cache
+*.tsbuildinfo

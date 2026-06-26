@@ -1,0 +1,30 @@
+[
+  {
+    "id": 1,
+    "name": "Basic 30",
+    "speed": 30,
+    "price": 29990,
+    "pppoeProfile": "Basic 30"
+  },
+  {
+    "id": 2,
+    "name": "Standard 50",
+    "speed": 50,
+    "price": 49990,
+    "pppoeProfile": "Standard 50"
+  },
+  {
+    "id": 3,
+    "name": "Premium 100",
+    "speed": 100,
+    "price": 79990,
+    "pppoeProfile": "Premium 100"
+  },
+  {
+    "id": 4,
+    "name": "Ultimate 250",
+    "speed": 250,
+    "price": 99990,
+    "pppoeProfile": "Ultimate 250"
+  }
+]

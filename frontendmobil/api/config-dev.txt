@@ -1,0 +1,16 @@
+// PENTING: Untuk pengembangan dan pengujian aplikasi seluler, Anda tidak dapat menggunakan 'localhost'.
+// Anda HARUS menggunakan alamat IP lokal dari komputer yang menjalankan server backend.
+
+// CARA MENEMUKAN IP LOKAL ANDA:
+// - Windows: Buka Command Prompt dan ketik `ipconfig`
+// - macOS/Linux: Buka Terminal dan ketik `ifconfig` atau `ip addr`
+// Cari alamat IPv4 yang biasanya dimulai dengan 192.168.x.x
+
+// Pastikan perangkat seluler Anda terhubung ke jaringan Wi-Fi yang SAMA dengan komputer Anda.
+
+// const LOCAL_IP_ADDRESS = '192.168.1.17'; // <-- ⚠️ GANTI INI dengan alamat IP lokal Anda.
+// const PORT = 3002;
+const LOCAL_IP_ADDRESS = 'billing.rizki-tech.com'; // <-- ⚠️ GANTI INI dengan alamat IP lokal Anda.
+const PORT = 80;
+
+export const API_BASE_URL = `http://${LOCAL_IP_ADDRESS}:${PORT}/api`;

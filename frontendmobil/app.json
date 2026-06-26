@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "RizkiTech BILL",
+    "slug": "rizkitech-bill-plus-mobile",
+    "version": "1.1.0",
+    "orientation": "portrait",
+    "icon": "assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.billing.rizkitech.com",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        }
+      }
+    },
+    "android": {
+      "package": "com.billing.rizkitech.com",
+      "adaptiveIcon": {
+        "foregroundImage": "assets/icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "versionCode": 1
+    },
+    "web": {},
+    "extra": {
+      "eas": {
+        "projectId": "5019f1a8-5c1e-4591-8fbe-87e050e89b1a"
+      }
+    }
+  },
+  "react-native-google-mobile-ads": {
+    "android_app_id": "ca-app-pub-3940256099942544~3347511713",
+    "ios_app_id": "ca-app-pub-3940256099942544~1458002511"
+  }
+}

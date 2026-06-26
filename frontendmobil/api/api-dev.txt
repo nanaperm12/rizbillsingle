@@ -1,0 +1,77 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+// Impor dari './config' dinonaktifkan sementara untuk debugging error 404.
+// import { API_BASE_URL } from './config';
+
+const SESSION_KEY = '@rizkitechbill_session';
+
+// --- DEBUGGING 404 ERROR ---
+// API_BASE_URL di-hardcode di sini untuk secara paksa menunjuk ke server pengembangan lokal.
+// Log debug menunjukkan bahwa aplikasi salah menunjuk ke URL produksi, kemungkinan karena masalah cache bundler.
+// Perubahan ini mengisolasi masalah. Pastikan IP ini cocok dengan server backend lokal Anda.
+const API_BASE_URL = 'http://192.168.100.2:3002/api';
+
+
+export const apiFetch = async (endpoint: string, options: RequestInit = {}): Promise<Response> => {
+    let apiKey: string | null = null;
+    try {
+        const sessionDataJSON = await AsyncStorage.getItem(SESSION_KEY);
+        if (sessionDataJSON) {
+            const { apiKey: storedApiKey } = JSON.parse(sessionDataJSON);
+            apiKey = storedApiKey;
+        }
+    } catch (e) {
+        console.error("Failed to get API key from storage", e);
+    }
+
+    let finalHeaders: HeadersInit = {};
+
+    if (options.headers) {
+        if (options.headers instanceof Headers) {
+            options.headers.forEach((value, key) => {
+                (finalHeaders as Record<string, string>)[key] = value;
+            });
+        } else if (Array.isArray(options.headers)) {
+             options.headers.forEach(([key, value]) => {
+                (finalHeaders as Record<string, string>)[key] = value;
+            });
+        } else {
+            finalHeaders = { ...options.headers };
+        }
+    }
+
+    if (apiKey) {
+        (finalHeaders as Record<string, string>)['x-api-key'] = apiKey;
+    }
+
+    if (options.body instanceof FormData) {
+        // Untuk FormData, biarkan browser mengatur header Content-Type dengan boundary yang benar.
+        delete (finalHeaders as Record<string, string>)['Content-Type'];
+        delete (finalHeaders as Record<string, string>)['content-type'];
+    } else {
+        // Hanya tambahkan Content-Type jika body ada dan belum diatur.
+        if (options.body && !(finalHeaders as Record<string, string>)['Content-Type'] && !(finalHeaders as Record<string, string>)['content-type']) {
+            (finalHeaders as Record<string, string>)['Content-Type'] = 'application/json';
+        }
+    }
+
+    const finalOptions: RequestInit = {
+        ...options,
+        headers: finalHeaders,
+    };
+    
+    const fullUrl = `${API_BASE_URL}${endpoint}`;
+
+    const response = await fetch(fullUrl, finalOptions);
+
+    if (!response.ok) {
+        try {
+            const errorData = await response.json();
+            throw new Error(errorData.message || `Request failed with status ${response.status}`);
+        } catch (e) {
+            // Jika respons error bukan JSON, lempar error generik.
+            throw new Error(`Request failed with status ${response.status}`);
+        }
+    }
+
+    return response;
+};
