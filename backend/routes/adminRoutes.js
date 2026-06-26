@@ -589,6 +589,45 @@ router.get('/settings/video-playlist/debug', async (req, res) => {
     }
 });
 
+router.get('/settings/video-playlist/export', async (req, res) => {
+    try {
+        const rawUrl = String(req.query.url || '').trim();
+        if (!rawUrl) {
+            return res.status(400).json({ message: 'URL playlist tidak tersedia.' });
+        }
+
+        let body = '';
+        let channelCount = 0;
+        let finalUrl = rawUrl;
+
+        if (rawUrl.startsWith('/uploads/')) {
+            const filePath = path.join(UPLOAD_DIR, path.basename(rawUrl));
+            if (!fs.existsSync(filePath)) {
+                return res.status(404).json({ message: 'File upload tidak ditemukan.' });
+            }
+            body = await fsPromises.readFile(filePath, 'utf8');
+        } else {
+            const debugResult = await debugPlaylistSource(rawUrl);
+            body = debugResult.body;
+            finalUrl = debugResult.response.url || rawUrl;
+        }
+
+        const playlistCheck = validatePlaylistContent(body);
+        channelCount = playlistCheck.extinfCount;
+
+        const safeName = `playlist-${Date.now()}.m3u8`;
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('X-Playlist-Channel-Count', String(channelCount));
+        res.setHeader('X-Playlist-Final-Url', finalUrl);
+        return res.send(body);
+    } catch (error) {
+        console.error('[Admin Playlist Export] Failed:', error);
+        res.status(500).json({ message: error.message || 'Gagal export playlist.' });
+    }
+});
+
 router.delete('/settings/video-playlist', async (req, res) => {
     try {
         const settings = await getSettings();

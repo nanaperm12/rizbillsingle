@@ -68,6 +68,7 @@ const VideoApiSettings: React.FC<VideoSettingsProps> = ({ settings, handleInputC
     const [isUploading, setIsUploading] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [isTesting, setIsTesting] = useState(false);
+    const [isExporting, setIsExporting] = useState(false);
     const [uploadError, setUploadError] = useState<string | null>(null);
     const [actionError, setActionError] = useState<string | null>(null);
     const [previewError, setPreviewError] = useState<string | null>(null);
@@ -189,6 +190,41 @@ const VideoApiSettings: React.FC<VideoSettingsProps> = ({ settings, handleInputC
 
     const handleTestUrl = async () => {
         await runDebug(String(settings.playlistUrl || '').trim());
+    };
+
+    const handleExportUrl = async () => {
+        const targetUrl = String(settings.playlistUrl || '').trim();
+        if (!targetUrl) {
+            setActionError('Isi URL playlist terlebih dahulu.');
+            return;
+        }
+
+        setIsExporting(true);
+        setActionError(null);
+        setUploadError(null);
+        setPreviewError(null);
+
+        try {
+            const res = await fetchWithAuth(`/api/admin/settings/video-playlist/export?url=${encodeURIComponent(targetUrl)}`);
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data.message || 'Gagal export playlist.');
+            }
+
+            const blob = await res.blob();
+            const objectUrl = window.URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = objectUrl;
+            link.download = `playlist-${Date.now()}.m3u8`;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            window.URL.revokeObjectURL(objectUrl);
+        } catch (error: any) {
+            setActionError(error?.message || 'Gagal export playlist.');
+        } finally {
+            setIsExporting(false);
+        }
     };
 
     return (
@@ -370,6 +406,14 @@ const VideoApiSettings: React.FC<VideoSettingsProps> = ({ settings, handleInputC
                                     className="rounded-md bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-500"
                                 >
                                     {isTesting ? 'Mengetes...' : 'Test Playlist URL'}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleExportUrl}
+                                    disabled={isExporting}
+                                    className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-400"
+                                >
+                                    {isExporting ? 'Exporting...' : 'Export M3U8'}
                                 </button>
                                 <button
                                     type="button"

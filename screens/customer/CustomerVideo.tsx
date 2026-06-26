@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
-import dashjs from 'dashjs';
+import * as dashjsModule from 'dashjs';
 import { fetchWithAuth } from '~/components/api';
 
 interface CustomerVideoProps {
@@ -26,17 +26,68 @@ type PlaylistItem = {
 };
 
 type RequestLogEntry = {
-    phase: 'playlist' | 'manifest' | 'segment' | 'key' | 'media';
+    phase: 'bootstrap' | 'playlist' | 'manifest' | 'segment' | 'key' | 'media';
     url: string;
     status?: number;
     contentType?: string;
     ok?: boolean;
+    note?: string;
+};
+
+type DashManifestState = {
+    checkedUrl: string;
+    drmProtected: boolean;
+    detail?: string;
+};
+
+type StreamKind = 'unknown' | 'hls' | 'dash' | 'media';
+type StreamProbeResult = {
+    kind: StreamKind;
+    contentType?: string;
+    status: number;
+    note: string;
+    text?: string;
 };
 
 const FAVORITES_KEY = 'rizkitechbill_tv_favorites';
 const LAST_CHANNEL_KEY = 'rizkitechbill_tv_last_channel';
+const dashjs = (dashjsModule as any).default ?? dashjsModule;
+const getDashPlayerFactory = () => {
+    const namespace = dashjs as any;
+    const factory = namespace?.MediaPlayer || (dashjsModule as any)?.MediaPlayer;
+    if (typeof factory !== 'function') {
+        return null;
+    }
+    return factory;
+};
 
 const attrPattern = /([a-zA-Z0-9-:]+)="([^"]*)"/g;
+
+const resolveUrl = (value: string, baseUrl?: string) => {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) return '';
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+    if (!baseUrl) return trimmed;
+    try {
+        return new URL(trimmed, baseUrl).href;
+    } catch {
+        return trimmed;
+    }
+};
+
+const resolvePlaylistBaseUrl = (value?: string) => {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) return '';
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+    if (typeof window !== 'undefined') {
+        try {
+            return new URL(trimmed, window.location.href).href;
+        } catch {
+            return trimmed;
+        }
+    }
+    return trimmed;
+};
 
 const readJsonArray = (key: string): string[] => {
     if (typeof window === 'undefined') return [];
@@ -54,7 +105,7 @@ const writeJsonArray = (key: string, values: string[]) => {
     window.localStorage.setItem(key, JSON.stringify(values));
 };
 
-const parsePlaylist = (text?: string): PlaylistItem[] => {
+const parsePlaylist = (text?: string, baseUrl?: string): PlaylistItem[] => {
     const lines = String(text || '')
         .split(/\r?\n/)
         .map((line) => line.trim())
@@ -89,8 +140,8 @@ const parsePlaylist = (text?: string): PlaylistItem[] => {
             id: `${items.length}-${title || streamUrl}`,
             title: title || 'Unknown Channel',
             groupTitle: attrs['group-title'] || attrs.groupTitle || 'Lainnya',
-            logoUrl: attrs['tvg-logo'] || attrs['group-logo'] || attrs.logo || '',
-            streamUrl: streamUrl.trim(),
+            logoUrl: resolveUrl(attrs['tvg-logo'] || attrs['group-logo'] || attrs.logo || '', baseUrl),
+            streamUrl: resolveUrl(streamUrl.trim(), baseUrl),
             rawInf: line,
         });
     }
@@ -101,6 +152,17 @@ const parsePlaylist = (text?: string): PlaylistItem[] => {
 const isHlsStream = (url: string) => /\.m3u8(\?.*)?$/i.test(url);
 const isDashStream = (url: string) => /\.mpd(\?.*)?$/i.test(url);
 const isAbsoluteHttpUrl = (url: string) => /^https?:\/\//i.test(url);
+const hasDrmProtection = (manifestText: string) => /<ContentProtection\b|cenc:pssh|schemeIdUri="urn:uuid:/i.test(manifestText);
+const looksLikeHlsBody = (text: string) => /#EXTM3U|#EXTINF|#EXT-X-STREAM-INF|#EXT-X-TARGETDURATION/i.test(text);
+const looksLikeDashBody = (text: string) => /<MPD\b|<AdaptationSet\b|<Representation\b|ContentProtection/i.test(text);
+const detectStreamKindFromContentType = (contentType?: string): StreamKind => {
+    const value = String(contentType || '').toLowerCase();
+    if (!value) return 'unknown';
+    if (value.includes('mpegurl') || value.includes('m3u8') || value.includes('application/x-mpegurl')) return 'hls';
+    if (value.includes('dash') || value.includes('application/dash+xml') || value.includes('mpd') || value.includes('xml')) return 'dash';
+    if (value.startsWith('video/') || value.startsWith('audio/')) return 'media';
+    return 'unknown';
+};
 
 const normalizeQuery = (value: string) => value.trim().toLowerCase();
 
@@ -116,9 +178,12 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
     controls = true,
     onPlayerModeChange,
 }) => {
+    const hasPlaylistSource = Boolean(String(playlistUrl || '').trim() || String(playlistText || '').trim());
+    const isFeatureEnabled = Boolean(enabled || hasPlaylistSource);
     const videoRef = useRef<HTMLVideoElement | null>(null);
     const hlsRef = useRef<Hls | null>(null);
     const dashRef = useRef<any>(null);
+    const dashRequestInterceptorRef = useRef<((request: any) => any) | null>(null);
     const autoFallbackUsedRef = useRef(false);
     const [error, setError] = useState<string | null>(null);
     const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -127,6 +192,10 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
     const [sourceLoading, setSourceLoading] = useState(false);
     const [mediaToken, setMediaToken] = useState<string | null>(null);
     const [mediaTokenLoading, setMediaTokenLoading] = useState(false);
+    const [dashManifestCheck, setDashManifestCheck] = useState<DashManifestState | null>(null);
+    const [dashManifestCache, setDashManifestCache] = useState<Record<string, DashManifestState>>({});
+    const [detectedStreamKind, setDetectedStreamKind] = useState<StreamKind>('unknown');
+    const [streamProbeLoading, setStreamProbeLoading] = useState(false);
     const [requestLog, setRequestLog] = useState<RequestLogEntry[]>([]);
     const [selectedId, setSelectedId] = useState<string | null>(() => {
         if (typeof window === 'undefined') return null;
@@ -182,7 +251,8 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
         };
     }, [playlistUrl, playlistText]);
 
-    const channels = useMemo(() => parsePlaylist(sourceText), [sourceText]);
+    const playlistBaseUrl = useMemo(() => resolvePlaylistBaseUrl(playlistUrl), [playlistUrl]);
+    const channels = useMemo(() => parsePlaylist(sourceText, playlistBaseUrl || undefined), [sourceText, playlistBaseUrl]);
     const groupNames = useMemo(() => {
         return Array.from(new Set(channels.map((item) => item.groupTitle))).sort((a, b) => a.localeCompare(b));
     }, [channels]);
@@ -215,15 +285,25 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
         return filteredChannels.findIndex((item) => item.id === selectedChannel.id);
     }, [filteredChannels, selectedChannel]);
 
+    const selectedDashManifestState = useMemo(() => {
+        if (!selectedChannel || !isDashStream(selectedChannel.streamUrl)) return null;
+        return dashManifestCache[selectedChannel.streamUrl] || null;
+    }, [dashManifestCache, selectedChannel]);
+
     const activeStreamUrl = selectedChannel?.streamUrl?.trim() || '';
     const shouldProxyStream = isAbsoluteHttpUrl(activeStreamUrl);
     const proxiedStreamUrl = useMemo(() => {
         if (!activeStreamUrl) return '';
         if (!shouldProxyStream) return activeStreamUrl;
-        if (!mediaToken) return '';
+        if (!mediaToken) return activeStreamUrl;
         return `/api/public/media-proxy?token=${encodeURIComponent(mediaToken)}&url=${encodeURIComponent(activeStreamUrl)}`;
     }, [activeStreamUrl, mediaToken, shouldProxyStream]);
     const visibleProxiedStreamUrl = proxiedStreamUrl;
+    const streamKind = useMemo<StreamKind>(() => {
+        if (isDashStream(visibleProxiedStreamUrl)) return 'dash';
+        if (isHlsStream(visibleProxiedStreamUrl)) return 'hls';
+        return detectedStreamKind;
+    }, [detectedStreamKind, visibleProxiedStreamUrl]);
 
     const pushRequestLog = useCallback((entry: RequestLogEntry) => {
         setRequestLog((prev) => [entry, ...prev].slice(0, 8));
@@ -258,21 +338,29 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
     const moveChannel = useCallback((delta: number, reason: 'manual' | 'fallback' = 'manual') => {
         if (!filteredChannels.length) return;
         const currentIndex = selectedIndex >= 0 ? selectedIndex : 0;
-        const nextIndex = (currentIndex + delta + filteredChannels.length) % filteredChannels.length;
-        const nextChannel = filteredChannels[nextIndex];
-        if (nextChannel) {
+        let nextIndex = (currentIndex + delta + filteredChannels.length) % filteredChannels.length;
+        let nextChannel = filteredChannels[nextIndex];
+        let visited = 0;
+
+        while (nextChannel && isDashStream(nextChannel.streamUrl) && dashManifestCache[nextChannel.streamUrl]?.drmProtected && visited < filteredChannels.length) {
+            nextIndex = (nextIndex + delta + filteredChannels.length) % filteredChannels.length;
+            nextChannel = filteredChannels[nextIndex];
+            visited += 1;
+        }
+
+        if (nextChannel && visited < filteredChannels.length) {
             selectChannel(nextChannel.id, reason);
         }
-    }, [filteredChannels, selectedIndex, selectChannel]);
+    }, [filteredChannels, selectedIndex, selectChannel, dashManifestCache]);
 
     useEffect(() => {
-        if (!enabled || !channels.length) {
+        if (!isFeatureEnabled || !channels.length) {
             onPlayerModeChange?.(false);
             return;
         }
         onPlayerModeChange?.(Boolean(activeStreamUrl));
         return () => onPlayerModeChange?.(false);
-    }, [enabled, channels.length, activeStreamUrl, onPlayerModeChange]);
+    }, [isFeatureEnabled, channels.length, activeStreamUrl, onPlayerModeChange]);
 
     useEffect(() => {
         if (!channels.length) return;
@@ -304,13 +392,19 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
 
     useEffect(() => {
         let active = true;
-        if (!enabled || !activeStreamUrl) {
+        if (!isFeatureEnabled || !activeStreamUrl) {
             setMediaToken(null);
             setMediaTokenLoading(false);
             return;
         }
 
         setMediaTokenLoading(true);
+        pushRequestLog({
+            phase: 'bootstrap',
+            url: activeStreamUrl,
+            ok: true,
+            note: shouldProxyStream ? 'Requesting media token' : 'Direct stream, token not needed',
+        });
         fetchWithAuth('/api/customers/media-token')
             .then((res) => res.json())
             .then((data) => {
@@ -319,11 +413,23 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                     throw new Error('Failed to get media token.');
                 }
                 setMediaToken(data.token);
+                pushRequestLog({
+                    phase: 'bootstrap',
+                    url: activeStreamUrl,
+                    ok: true,
+                    note: 'Media token ready',
+                });
             })
             .catch((err: any) => {
                 if (!active) return;
                 setMediaToken(null);
                 setError(err?.message || 'Gagal mengambil token pemutar.');
+                pushRequestLog({
+                    phase: 'bootstrap',
+                    url: activeStreamUrl,
+                    ok: false,
+                    note: err?.message || 'Gagal mengambil token pemutar.',
+                });
             })
             .finally(() => {
                 if (!active) return;
@@ -333,12 +439,247 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
         return () => {
             active = false;
         };
-    }, [enabled, activeStreamUrl]);
+    }, [isFeatureEnabled, activeStreamUrl, pushRequestLog, shouldProxyStream]);
+
+    useEffect(() => {
+        let active = true;
+        if (!isFeatureEnabled || !visibleProxiedStreamUrl || streamKind !== 'dash') {
+            setDashManifestCheck(null);
+            return;
+        }
+
+        const cached = dashManifestCache[visibleProxiedStreamUrl];
+        if (cached) {
+            setDashManifestCheck(cached);
+            return;
+        }
+
+        setDashManifestCheck(null);
+        fetch(visibleProxiedStreamUrl, { cache: 'no-store' })
+            .then((res) => res.text().then((text) => ({
+                ok: res.ok,
+                status: res.status,
+                contentType: res.headers.get('content-type') || undefined,
+                text,
+            })))
+            .then(({ ok, status, contentType, text }) => {
+                if (!active) return;
+                const drmProtected = hasDrmProtection(text);
+                const nextState: DashManifestState = {
+                    checkedUrl: visibleProxiedStreamUrl,
+                    drmProtected,
+                    detail: drmProtected
+                        ? 'Manifest mengandung ContentProtection/DRM.'
+                        : 'Manifest DASH tanpa DRM terdeteksi.',
+                };
+                setDashManifestCheck(nextState);
+                setDashManifestCache((prev) => ({
+                    ...prev,
+                    [visibleProxiedStreamUrl]: nextState,
+                }));
+                pushRequestLog({
+                    phase: 'manifest',
+                    url: visibleProxiedStreamUrl,
+                    status,
+                    contentType,
+                    ok,
+                    note: drmProtected ? 'DRM detected' : 'Manifest checked',
+                });
+            })
+            .catch((err: any) => {
+                if (!active) return;
+                const nextState: DashManifestState = {
+                    checkedUrl: visibleProxiedStreamUrl,
+                    drmProtected: false,
+                    detail: err?.message || 'Gagal memeriksa manifest DASH.',
+                };
+                setDashManifestCheck(nextState);
+                setDashManifestCache((prev) => ({
+                    ...prev,
+                    [visibleProxiedStreamUrl]: nextState,
+                }));
+            });
+
+        return () => {
+            active = false;
+        };
+    }, [isFeatureEnabled, visibleProxiedStreamUrl, streamKind, pushRequestLog, dashManifestCache]);
+
+    useEffect(() => {
+        let active = true;
+        if (!isFeatureEnabled || !activeStreamUrl) {
+            setDetectedStreamKind('unknown');
+            setStreamProbeLoading(false);
+            return;
+        }
+
+        if (isHlsStream(visibleProxiedStreamUrl)) {
+            setDetectedStreamKind('hls');
+            setStreamProbeLoading(false);
+            return;
+        }
+        if (isDashStream(visibleProxiedStreamUrl)) {
+            setDetectedStreamKind('dash');
+            setStreamProbeLoading(false);
+            return;
+        }
+
+        setStreamProbeLoading(Boolean(shouldProxyStream && mediaTokenLoading));
+        if (!shouldProxyStream || !mediaToken) {
+            return;
+        }
+
+        setStreamProbeLoading(true);
+        const probeUrl = `${visibleProxiedStreamUrl}${visibleProxiedStreamUrl.includes('?') ? '&' : '?'}_probe=${Date.now()}`;
+
+        fetch(probeUrl, {
+            method: 'HEAD',
+            cache: 'no-store',
+        })
+            .then((res): StreamProbeResult | Promise<StreamProbeResult> => {
+                const contentType = res.headers.get('content-type') || undefined;
+                const guessed = detectStreamKindFromContentType(contentType);
+                if (guessed !== 'unknown') {
+                    return { kind: guessed, contentType, status: res.status, note: 'HEAD probe' };
+                }
+
+                return fetch(probeUrl, {
+                    method: 'GET',
+                    headers: {
+                        Range: 'bytes=0-4095',
+                    },
+                    cache: 'no-store',
+                }).then(async (bodyRes): Promise<StreamProbeResult> => {
+                    const bodyText = await bodyRes.text();
+                    const text = bodyText.slice(0, 4096);
+                    const bodyKind = looksLikeDashBody(text)
+                        ? 'dash'
+                        : looksLikeHlsBody(text)
+                            ? 'hls'
+                            : detectStreamKindFromContentType(bodyRes.headers.get('content-type') || undefined);
+                    return {
+                        kind: bodyKind,
+                        contentType: bodyRes.headers.get('content-type') || undefined,
+                        status: bodyRes.status,
+                        note: 'Body probe',
+                        text,
+                    };
+                });
+            })
+            .then((result) => {
+                if (!active) return;
+                const nextKind = result.kind || 'unknown';
+                setDetectedStreamKind(nextKind);
+                pushRequestLog({
+                    phase: 'bootstrap',
+                    url: visibleProxiedStreamUrl,
+                    status: result.status,
+                    contentType: result.contentType,
+                    ok: nextKind !== 'unknown',
+                    note: `${result.note || 'Probe'} => ${nextKind}`,
+                });
+            })
+            .catch((err: any) => {
+                if (!active) return;
+                setDetectedStreamKind('unknown');
+                pushRequestLog({
+                    phase: 'bootstrap',
+                    url: visibleProxiedStreamUrl,
+                    ok: false,
+                    note: err?.message || 'Gagal mendeteksi tipe stream.',
+                });
+            })
+            .finally(() => {
+                if (!active) return;
+                setStreamProbeLoading(false);
+            });
+
+        return () => {
+            active = false;
+        };
+    }, [isFeatureEnabled, activeStreamUrl, visibleProxiedStreamUrl, shouldProxyStream, mediaToken, mediaTokenLoading, pushRequestLog]);
+
+    useEffect(() => {
+        if (selectedDashManifestState?.drmProtected) {
+            setStatusMessage('Channel ini memakai DRM dan tidak bisa diputar di web player.');
+            setError(null);
+        }
+    }, [selectedDashManifestState]);
 
     useEffect(() => {
         const videoEl = videoRef.current;
         if (!videoEl) return;
         videoEl.crossOrigin = 'anonymous';
+
+        const onLoadStart = () => {
+            pushRequestLog({
+                phase: 'bootstrap',
+                url: visibleProxiedStreamUrl || activeStreamUrl || 'n/a',
+                ok: true,
+                note: 'Video element loadstart',
+            });
+        };
+        const onLoadedMetadata = () => {
+            pushRequestLog({
+                phase: 'media',
+                url: visibleProxiedStreamUrl || activeStreamUrl || 'n/a',
+                ok: true,
+                note: 'loadedmetadata',
+            });
+            setIsLoading(false);
+        };
+        const onCanPlay = () => {
+            pushRequestLog({
+                phase: 'media',
+                url: visibleProxiedStreamUrl || activeStreamUrl || 'n/a',
+                ok: true,
+                note: 'canplay',
+            });
+            setIsLoading(false);
+        };
+        const onPlaying = () => {
+            pushRequestLog({
+                phase: 'media',
+                url: visibleProxiedStreamUrl || activeStreamUrl || 'n/a',
+                ok: true,
+                note: 'playing',
+            });
+            setIsLoading(false);
+        };
+        const onStalled = () => {
+            pushRequestLog({
+                phase: 'media',
+                url: visibleProxiedStreamUrl || activeStreamUrl || 'n/a',
+                ok: false,
+                note: 'stalled',
+            });
+        };
+        const onWaiting = () => {
+            pushRequestLog({
+                phase: 'media',
+                url: visibleProxiedStreamUrl || activeStreamUrl || 'n/a',
+                ok: false,
+                note: 'waiting',
+            });
+        };
+        const onNativeError = () => {
+            const mediaError = videoEl.error;
+            pushRequestLog({
+                phase: 'media',
+                url: visibleProxiedStreamUrl || activeStreamUrl || 'n/a',
+                status: mediaError?.code,
+                ok: false,
+                note: mediaError?.message || 'video error',
+            });
+        };
+
+        videoEl.addEventListener('loadstart', onLoadStart);
+        videoEl.addEventListener('loadedmetadata', onLoadedMetadata);
+        videoEl.addEventListener('canplay', onCanPlay);
+        videoEl.addEventListener('playing', onPlaying);
+        videoEl.addEventListener('stalled', onStalled);
+        videoEl.addEventListener('waiting', onWaiting);
+        videoEl.addEventListener('error', onNativeError);
 
         const cleanup = () => {
             if (hlsRef.current) {
@@ -346,16 +687,26 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                 hlsRef.current = null;
             }
             if (dashRef.current) {
+                if (dashRequestInterceptorRef.current && typeof dashRef.current.removeRequestInterceptor === 'function') {
+                    dashRef.current.removeRequestInterceptor(dashRequestInterceptorRef.current);
+                }
+                dashRequestInterceptorRef.current = null;
                 dashRef.current.reset();
                 dashRef.current = null;
             }
             videoEl.pause();
             videoEl.removeAttribute('src');
             videoEl.load();
-            videoEl.onerror = null;
+            videoEl.removeEventListener('loadstart', onLoadStart);
+            videoEl.removeEventListener('loadedmetadata', onLoadedMetadata);
+            videoEl.removeEventListener('canplay', onCanPlay);
+            videoEl.removeEventListener('playing', onPlaying);
+            videoEl.removeEventListener('stalled', onStalled);
+            videoEl.removeEventListener('waiting', onWaiting);
+            videoEl.removeEventListener('error', onNativeError);
         };
 
-        if (!enabled || !visibleProxiedStreamUrl) {
+        if (!isFeatureEnabled || (!activeStreamUrl && !selectedChannel)) {
             setError(null);
             setIsLoading(false);
             cleanup();
@@ -391,68 +742,120 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
         };
 
         const canPlayNativeHls = videoEl.canPlayType('application/vnd.apple.mpegurl');
-        const shouldUseHls = isHlsStream(visibleProxiedStreamUrl);
-        const shouldUseDash = isDashStream(visibleProxiedStreamUrl);
+        const shouldUseHls = isHlsStream(visibleProxiedStreamUrl) || streamKind === 'hls';
+        const shouldUseDash = isDashStream(visibleProxiedStreamUrl) || streamKind === 'dash';
         const onVideoError = () => handleFailure('Stream tidak bisa diputar.');
-
-        if (shouldProxyStream && !mediaToken) {
-            setIsLoading(false);
-            setError('Token pemutar belum siap. Coba lagi dalam beberapa detik.');
-            return cleanup;
-        }
+        pushRequestLog({
+            phase: 'bootstrap',
+            url: visibleProxiedStreamUrl || activeStreamUrl || 'n/a',
+            ok: true,
+            note: `mode=${shouldUseDash ? 'dash' : shouldUseHls ? 'hls' : 'direct'}; nativeHls=${Boolean(canPlayNativeHls)}; hlsJs=${Hls.isSupported()}; detected=${streamKind}`,
+        });
 
         if (shouldUseDash) {
             try {
-                const player = dashjs.MediaPlayer().create();
+                if (typeof window === 'undefined' || !('MediaSource' in window)) {
+                    throw new Error('Browser tidak mendukung DASH/MSE.');
+                }
+
+                if (dashManifestCheck?.drmProtected && dashManifestCheck.checkedUrl === visibleProxiedStreamUrl) {
+                    throw new Error('Stream DASH ini terenkripsi/DRM dan memerlukan license server.');
+                }
+
+                const mediaPlayerFactory = getDashPlayerFactory();
+                if (!mediaPlayerFactory) {
+                    throw new Error('dash.js MediaPlayer tidak tersedia.');
+                }
+
+                const playerFactory = mediaPlayerFactory();
+                const player = typeof playerFactory?.create === 'function' ? playerFactory.create() : playerFactory;
+                if (!player) {
+                    throw new Error('Gagal membuat instance dash.js player.');
+                }
                 dashRef.current = player;
-                player.updateSettings({
-                    streaming: {
-                        lowLatencyEnabled: true,
-                        fastSwitchEnabled: true,
-                    },
-                });
-                player.on(dashjs.MediaPlayer.events.PLAYBACK_ERROR, (e: any) => {
-                    pushRequestLog({
-                        phase: 'media',
-                        url: visibleProxiedStreamUrl,
-                        status: e?.event?.responsecode,
-                        ok: false,
+                dashRequestInterceptorRef.current = (request: any) => {
+                    const requestUrl = String(request?.url || '').trim();
+                    if (!requestUrl || !isAbsoluteHttpUrl(requestUrl) || requestUrl.includes('/api/public/media-proxy?')) {
+                        return request;
+                    }
+                    request.url = `/api/public/media-proxy?token=${encodeURIComponent(mediaToken || '')}&url=${encodeURIComponent(requestUrl)}`;
+                    return request;
+                };
+                if (typeof player.addRequestInterceptor === 'function') {
+                    player.addRequestInterceptor(dashRequestInterceptorRef.current);
+                }
+                if (typeof player.updateSettings === 'function') {
+                    player.updateSettings({
+                        streaming: {
+                            lowLatencyEnabled: true,
+                            fastSwitchEnabled: true,
+                        },
                     });
-                    handleFailure('Playback DASH gagal.');
-                });
-                player.initialize(videoEl, visibleProxiedStreamUrl, autoplay);
-                player.on(dashjs.MediaPlayer.events.ERROR, (e: any) => {
-                    pushRequestLog({
-                        phase: 'manifest',
-                        url: visibleProxiedStreamUrl,
-                        status: e?.event?.responsecode || e?.event?.status || e?.event?.error?.code,
-                        ok: false,
+                }
+                const dashEvents = (dashjs as any)?.MediaPlayer?.events || (dashjsModule as any)?.MediaPlayer?.events;
+                if (dashEvents?.PLAYBACK_ERROR) {
+                    player.on(dashEvents.PLAYBACK_ERROR, (e: any) => {
+                        pushRequestLog({
+                            phase: 'media',
+                            url: visibleProxiedStreamUrl,
+                            status: e?.event?.responsecode,
+                            ok: false,
+                            note: e?.event?.message || 'dash.js playback error',
+                        });
                     });
-                    handleFailure(e?.event?.message || 'Gagal memutar stream DASH.');
-                });
+                }
+                if (dashEvents?.STREAM_INITIALIZED) {
+                    player.on(dashEvents.STREAM_INITIALIZED, () => {
+                        pushRequestLog({
+                            phase: 'manifest',
+                            url: visibleProxiedStreamUrl,
+                            ok: true,
+                            note: 'Stream initialized',
+                        });
+                        setIsLoading(false);
+                    });
+                }
+                if (dashEvents?.PLAYBACK_PLAYING) {
+                    player.on(dashEvents.PLAYBACK_PLAYING, () => {
+                        setIsLoading(false);
+                    });
+                }
+                if (typeof player.initialize === 'function') {
+                    player.initialize(videoEl, visibleProxiedStreamUrl, autoplay);
+                } else if (typeof player.attachView === 'function' && typeof player.attachSource === 'function') {
+                    player.attachView(videoEl);
+                    player.attachSource(visibleProxiedStreamUrl);
+                    if (autoplay) {
+                        void videoEl.play().catch(() => undefined);
+                    }
+                } else {
+                    throw new Error('dash.js player API tidak tersedia.');
+                }
+                if (dashEvents?.ERROR) {
+                    player.on(dashEvents.ERROR, (e: any) => {
+                        const eventMessage = e?.event?.message || e?.event?.error?.message || e?.event?.error?.name || '';
+                        pushRequestLog({
+                            phase: 'manifest',
+                            url: visibleProxiedStreamUrl,
+                            status: e?.event?.responsecode || e?.event?.status || e?.event?.error?.code,
+                            ok: false,
+                            note: eventMessage || undefined,
+                        });
+                        handleFailure(eventMessage || 'Gagal memutar stream DASH.');
+                    });
+                }
                 pushRequestLog({
                     phase: 'manifest',
                     url: visibleProxiedStreamUrl,
                     ok: true,
                 });
-                setIsLoading(false);
                 return cleanup;
             } catch (error) {
                 console.error('[DASH Player] Failed to initialize player:', error);
-                handleFailure('Gagal menyiapkan player DASH.');
+                const message = error instanceof Error ? error.message : 'Gagal menyiapkan player DASH.';
+                handleFailure(message);
                 return cleanup;
             }
-        }
-
-        if (shouldUseHls && canPlayNativeHls) {
-            videoEl.src = visibleProxiedStreamUrl;
-            videoEl.onerror = onVideoError;
-            videoEl.load();
-            setIsLoading(false);
-            if (autoplay) {
-                void videoEl.play().catch(() => undefined);
-            }
-            return cleanup;
         }
 
         if (shouldUseHls && Hls.isSupported()) {
@@ -475,6 +878,12 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                 },
             });
             hlsRef.current = hls;
+            pushRequestLog({
+                phase: 'bootstrap',
+                url: visibleProxiedStreamUrl,
+                ok: true,
+                note: 'Hls.js attach/loadSource',
+            });
             hls.loadSource(visibleProxiedStreamUrl);
             hls.attachMedia(videoEl);
             videoEl.onerror = onVideoError;
@@ -504,22 +913,39 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
             return cleanup;
         }
 
+        if (shouldUseHls && canPlayNativeHls) {
+            pushRequestLog({
+                phase: 'bootstrap',
+                url: visibleProxiedStreamUrl,
+                ok: true,
+                note: 'Native HLS path',
+            });
+            videoEl.src = visibleProxiedStreamUrl;
+            videoEl.load();
+            setIsLoading(false);
+            if (autoplay) {
+                void videoEl.play().catch(() => undefined);
+            }
+            return cleanup;
+        }
+
+        pushRequestLog({
+            phase: 'bootstrap',
+            url: visibleProxiedStreamUrl,
+            ok: true,
+            note: 'Fallback media element path',
+        });
         videoEl.src = visibleProxiedStreamUrl;
         videoEl.onerror = onVideoError;
         videoEl.load();
-        pushRequestLog({
-            phase: 'media',
-            url: visibleProxiedStreamUrl,
-            ok: true,
-        });
         setIsLoading(false);
         if (autoplay) {
             void videoEl.play().catch(() => undefined);
         }
         return cleanup;
-    }, [enabled, visibleProxiedStreamUrl, autoplay, filteredChannels, moveChannel, clearRequestLog, pushRequestLog, mediaToken, shouldProxyStream]);
+    }, [isFeatureEnabled, visibleProxiedStreamUrl, activeStreamUrl, autoplay, filteredChannels, moveChannel, clearRequestLog, pushRequestLog, mediaToken, shouldProxyStream, selectedChannel, streamKind]);
 
-    if (!enabled) {
+    if (!isFeatureEnabled) {
         return (
             <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-6 text-sm text-gray-600 shadow-sm dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
                 Fitur TV belum diaktifkan oleh admin.
@@ -527,10 +953,10 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
         );
     }
 
-    if (sourceLoading || mediaTokenLoading) {
+    if (sourceLoading) {
         return (
             <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-6 text-sm text-gray-600 shadow-sm dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
-                {sourceLoading ? 'Memuat playlist...' : 'Menyiapkan pemutar...'}
+                Memuat playlist...
             </div>
         );
     }
@@ -563,6 +989,12 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                     <div className="flex flex-wrap items-center gap-2 text-xs text-slate-200">
                         <span className="rounded-full bg-white/10 px-3 py-1">{channels.length} channel</span>
                         <span className="rounded-full bg-white/10 px-3 py-1">{favoriteIds.length} favorit</span>
+                        <span className="rounded-full bg-white/10 px-3 py-1">
+                            Token: {mediaToken ? 'ready' : mediaTokenLoading ? 'loading' : 'missing'}
+                        </span>
+                        <span className="rounded-full bg-white/10 px-3 py-1">
+                            Probe: {streamProbeLoading ? 'loading' : detectedStreamKind}
+                        </span>
                         <button
                             type="button"
                             onClick={() => moveChannel(-1)}
@@ -583,8 +1015,8 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                 </div>
             </div>
 
-            <div className="grid gap-5 lg:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.85fr)]">
-                <div className="overflow-hidden rounded-2xl border border-gray-200 bg-black shadow-sm dark:border-gray-700">
+            <div className="grid gap-5 lg:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.85fr)] lg:items-start">
+                <div className="overflow-hidden rounded-2xl border border-gray-200 bg-black shadow-sm dark:border-gray-700 lg:sticky lg:top-4">
                     <div className="relative aspect-video">
                         <video
                             ref={videoRef}
@@ -596,9 +1028,9 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                             muted={autoplay}
                             playsInline
                         />
-                        {isLoading && (
+                        {(isLoading || mediaTokenLoading || streamProbeLoading) && (
                             <div className="absolute inset-0 flex items-center justify-center bg-black/60 text-sm text-white">
-                                Memuat channel...
+                                {streamProbeLoading ? 'Mendeteksi tipe stream...' : mediaTokenLoading ? 'Menyiapkan token pemutar...' : 'Memuat channel...'}
                             </div>
                         )}
                     </div>
@@ -620,12 +1052,12 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                         </div>
                         <div className="mt-3 grid gap-2 text-[11px] text-slate-300">
                             <div className="truncate"><span className="text-slate-400">Source:</span> {activeStreamUrl || 'n/a'}</div>
-                            <div className="truncate"><span className="text-slate-400">Proxy:</span> {visibleProxiedStreamUrl || 'n/a'}</div>
+                            <div className="truncate"><span className="text-slate-400">Proxy:</span> {visibleProxiedStreamUrl || activeStreamUrl || 'n/a'}</div>
                         </div>
                     </div>
                 </div>
 
-                <div className="space-y-4">
+                <div className="space-y-4 lg:max-h-[calc(100vh-7.5rem)] lg:overflow-y-auto lg:pr-1">
                     <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800">
                         <div className="grid gap-3">
                             <div>
@@ -705,6 +1137,7 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                                         <div className="grid grid-cols-2 gap-3 p-4 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3">
                                             {groupItems.map((item) => {
                                                 const active = selectedChannel?.id === item.id;
+                                                const dashState = isDashStream(item.streamUrl) ? dashManifestCache[item.streamUrl] : null;
                                                 const initials = item.title
                                                     .split(' ')
                                                     .filter(Boolean)
@@ -742,6 +1175,11 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                                                                     Fav
                                                                 </span>
                                                             ) : null}
+                                                            {dashState?.drmProtected ? (
+                                                                <span className="absolute left-2 top-2 rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-semibold text-black">
+                                                                    DRM
+                                                                </span>
+                                                            ) : null}
                                                         </div>
                                                         <div className="p-3">
                                                             <div className="line-clamp-2 text-sm font-semibold text-gray-900 dark:text-gray-100">
@@ -763,6 +1201,7 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                                     <div className="grid grid-cols-2 gap-3 p-4 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3">
                                         {filteredChannels.map((item) => {
                                             const active = selectedChannel?.id === item.id;
+                                            const dashState = isDashStream(item.streamUrl) ? dashManifestCache[item.streamUrl] : null;
                                             const initials = item.title
                                                 .split(' ')
                                                 .filter(Boolean)
@@ -798,6 +1237,11 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                                                         {favoriteIds.includes(item.id) ? (
                                                             <span className="absolute right-2 top-2 rounded-full bg-black/70 px-2 py-0.5 text-[10px] font-semibold text-white">
                                                                 Fav
+                                                            </span>
+                                                        ) : null}
+                                                        {dashState?.drmProtected ? (
+                                                            <span className="absolute left-2 top-2 rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-semibold text-black">
+                                                                DRM
                                                             </span>
                                                         ) : null}
                                                     </div>
@@ -837,6 +1281,8 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                     <div><span className="text-gray-400">Selected:</span> {selectedChannel?.title || 'n/a'}</div>
                     <div className="break-all"><span className="text-gray-400">Source URL:</span> {activeStreamUrl || 'n/a'}</div>
                     <div className="break-all"><span className="text-gray-400">Proxy URL:</span> {visibleProxiedStreamUrl || 'n/a'}</div>
+                    <div><span className="text-gray-400">Token:</span> {mediaToken ? 'ready' : mediaTokenLoading ? 'loading' : 'missing'}</div>
+                    <div><span className="text-gray-400">Detect:</span> {streamProbeLoading ? 'loading' : detectedStreamKind}</div>
                 </div>
                 <div className="mt-3 space-y-2">
                     {requestLog.length > 0 ? requestLog.map((entry, idx) => (
@@ -851,12 +1297,21 @@ const CustomerVideo: React.FC<CustomerVideoProps> = ({
                             <div className="mt-1 flex flex-wrap gap-2 text-gray-500 dark:text-gray-400">
                                 {typeof entry.status === 'number' ? <span>Status: {entry.status}</span> : null}
                                 {entry.contentType ? <span>Type: {entry.contentType}</span> : null}
+                                {entry.note ? <span>Note: {entry.note}</span> : null}
                             </div>
                         </div>
                     )) : (
                         <div className="text-xs text-gray-500 dark:text-gray-400">Belum ada log request.</div>
                     )}
                 </div>
+                {dashManifestCheck ? (
+                    <div className="mt-3 rounded-xl border border-gray-200 bg-gray-50 p-3 text-[11px] text-gray-600 dark:border-gray-700 dark:bg-gray-900/50 dark:text-gray-300">
+                        <div className="font-semibold text-gray-700 dark:text-gray-200">DASH Check</div>
+                        <div className="mt-1 break-all">URL: {dashManifestCheck.checkedUrl}</div>
+                        <div className="mt-1">DRM: {dashManifestCheck.drmProtected ? 'Ya' : 'Tidak'}</div>
+                        <div className="mt-1">{dashManifestCheck.detail}</div>
+                    </div>
+                ) : null}
             </div>
         </div>
     );

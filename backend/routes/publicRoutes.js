@@ -5,6 +5,8 @@ import whatsappService from '../whatsappService.js';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import tripayService from '../tripayService.js';
+import http from 'node:http';
+import https from 'node:https';
 
 const router = express.Router();
 const PUBLIC_APP_SETTINGS_FALLBACK = {
@@ -14,13 +16,53 @@ const PUBLIC_APP_SETTINGS_FALLBACK = {
     }
 };
 
-const rewriteProxyPlaylistBody = (body, token, baseUrl) => {
-    const proxyUrlFor = (targetUrl) => `/api/public/media-proxy?token=${encodeURIComponent(token)}&url=${encodeURIComponent(targetUrl)}`;
+const appendProxyHeaderHints = (targetUrl, headerHints = {}) => {
+    const url = new URL(targetUrl, targetUrl);
+    if (headerHints.userAgent && !url.searchParams.has('ua')) {
+        url.searchParams.set('ua', headerHints.userAgent);
+    }
+    if (headerHints.referer && !url.searchParams.has('referer')) {
+        url.searchParams.set('referer', headerHints.referer);
+    }
+    if (headerHints.origin && !url.searchParams.has('origin')) {
+        url.searchParams.set('origin', headerHints.origin);
+    }
+    if (headerHints.acceptLanguage && !url.searchParams.has('accept-language')) {
+        url.searchParams.set('accept-language', headerHints.acceptLanguage);
+    }
+    return url.toString();
+};
+
+const rewriteProxyPlaylistBody = (body, token, baseUrl, headerHints = {}) => {
+    const proxyUrlFor = (targetUrl) => {
+        const proxiedTarget = appendProxyHeaderHints(targetUrl, headerHints);
+        return `/api/public/media-proxy?token=${encodeURIComponent(token)}&url=${encodeURIComponent(proxiedTarget)}`;
+    };
+
     return String(body || '')
         .split(/\r?\n/)
         .map((line) => {
             const trimmed = line.trim();
             if (!trimmed) return line;
+
+            if (trimmed.startsWith('#EXTVLCOPT:')) {
+                const optionValue = trimmed.slice('#EXTVLCOPT:'.length).trim();
+                const [keyRaw, ...valueParts] = optionValue.split('=');
+                const key = String(keyRaw || '').trim().toLowerCase();
+                const value = valueParts.join('=').trim().replace(/^"(.*)"$/, '$1');
+
+                if (key === 'http-user-agent' && value) {
+                    headerHints.userAgent = value;
+                } else if ((key === 'http-referrer' || key === 'http-referer') && value) {
+                    headerHints.referer = value;
+                } else if (key === 'http-origin' && value) {
+                    headerHints.origin = value;
+                } else if (key === 'http-accept-language' && value) {
+                    headerHints.acceptLanguage = value;
+                }
+                return line;
+            }
+
             if (trimmed.startsWith('#')) {
                 return line.replace(/URI="([^"]+)"/gi, (_match, uri) => {
                     try {
@@ -42,8 +84,7 @@ const rewriteProxyPlaylistBody = (body, token, baseUrl) => {
         .join('\n');
 };
 
-const rewriteProxyMediaBody = (body, token, baseUrl) => {
-    const proxyUrlFor = (targetUrl) => `/api/public/media-proxy?token=${encodeURIComponent(token)}&url=${encodeURIComponent(targetUrl)}`;
+const rewriteProxyMediaBody = (body, token, baseUrl, headerHints = {}) => {
     const resolveUrl = (value) => {
         try {
             return new URL(value, baseUrl).href;
@@ -54,28 +95,200 @@ const rewriteProxyMediaBody = (body, token, baseUrl) => {
 
     let rewritten = String(body || '');
 
-    rewritten = rewritten.replace(/(URI|url|sourceURL|initialization|media|xlink:href)="([^"]+)"/gi, (match, attr, value) => {
+    rewritten = rewritten.replace(/\b(URI|url|sourceURL|initialization|media|xlink:href|href)="([^"]+)"/gi, (match, attr, value) => {
+        const lowerAttr = String(attr || '').toLowerCase();
+        if (lowerAttr.startsWith('xmlns') || /schemaLocation$/i.test(lowerAttr)) {
+            return match;
+        }
         if (/^(indexRange|range)$/i.test(attr)) {
             return match;
         }
+        if (value.includes('$')) {
+            return match;
+        }
         const resolved = resolveUrl(value);
-        return `${attr}="${proxyUrlFor(resolved)}"`;
+        return `${attr}="${resolved}"`;
     });
 
     rewritten = rewritten.replace(/<BaseURL>([^<]+)<\/BaseURL>/gi, (_match, value) => {
         const trimmed = String(value || '').trim();
         if (!trimmed) return _match;
-        return `<BaseURL>${proxyUrlFor(resolveUrl(trimmed))}</BaseURL>`;
+        return `<BaseURL>${resolveUrl(trimmed)}</BaseURL>`;
     });
 
-    rewritten = rewritten.replace(/https?:\/\/[^\s"'<>]+/gi, (match) => proxyUrlFor(match));
+    rewritten = rewritten.replace(/<Location>([^<]+)<\/Location>/gi, (_match, value) => {
+        const trimmed = String(value || '').trim();
+        if (!trimmed || /^data:/i.test(trimmed)) return _match;
+        return `<Location>${resolveUrl(trimmed)}</Location>`;
+    });
+
+    const dashBaseUrl = (() => {
+        try {
+            return new URL('.', baseUrl).href;
+        } catch {
+            return baseUrl;
+        }
+    })();
+
+    if (/\bSegmentTemplate\b/i.test(rewritten) && !/<BaseURL>/i.test(rewritten)) {
+        rewritten = rewritten.replace(/(<MPD\b[^>]*>)/i, `$1\n  <BaseURL>${dashBaseUrl}</BaseURL>`);
+    }
     return rewritten;
 };
 
-router.get('/media-proxy', async (req, res) => {
+const buildUpstreamHeaders = (req) => {
+    let targetOrigin = '';
+    try {
+        const requestedTarget = normalizeTargetUrl(req.query?.url);
+        targetOrigin = requestedTarget ? new URL(requestedTarget).origin : '';
+    } catch {
+        targetOrigin = '';
+    }
+
+    const headers = {
+        'User-Agent': req.get('user-agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': req.get('accept') || '*/*',
+        'Accept-Language': req.get('accept-language') || 'en-US,en;q=0.9,id;q=0.8',
+        'Cache-Control': req.get('cache-control') || 'no-cache',
+        'Pragma': req.get('pragma') || 'no-cache',
+    };
+
+    const forwardedHeaders = [
+        'range',
+        'if-range',
+        'if-modified-since',
+        'if-none-match',
+        'origin',
+        'ua',
+        'accept-language',
+    ];
+
+    for (const headerName of forwardedHeaders) {
+        const value = req.get(headerName);
+        if (value) {
+            headers[headerName] = value;
+        }
+    }
+
+    headers['accept-encoding'] = 'identity';
+    headers.connection = 'keep-alive';
+
+    if (req.query?.ua) {
+        headers['User-Agent'] = String(req.query.ua);
+    }
+    if (req.query?.referer) {
+        headers.referer = String(req.query.referer);
+    } else if (targetOrigin) {
+        headers.referer = `${targetOrigin}/`;
+    }
+    if (req.query?.origin) {
+        headers.origin = String(req.query.origin);
+    } else if (targetOrigin) {
+        headers.origin = targetOrigin;
+    }
+    if (req.query?.['accept-language']) {
+        headers['Accept-Language'] = String(req.query['accept-language']);
+    }
+
+    if (/detik\.com$/i.test(targetOrigin)) {
+        headers.referer = headers.referer || 'https://video.detik.com/';
+        headers.origin = headers.origin || 'https://video.detik.com';
+    }
+
+    return headers;
+};
+
+const getRequestHeaderHints = (req, targetUrl) => {
+    let origin = '';
+    try {
+        origin = new URL(targetUrl).origin;
+    } catch {
+        origin = '';
+    }
+
+    return {
+        userAgent: req.query?.ua ? String(req.query.ua) : req.get('user-agent') || undefined,
+        referer: req.query?.referer ? String(req.query.referer) : targetUrl,
+        origin: req.query?.origin ? String(req.query.origin) : origin || undefined,
+        acceptLanguage: req.query?.['accept-language'] ? String(req.query['accept-language']) : req.get('accept-language') || undefined,
+    };
+};
+
+const requestUpstream = async (targetUrl, headers, depth = 0, method = 'GET') => {
+    const parsedUrl = new URL(targetUrl);
+    const requestModule = parsedUrl.protocol === 'https:' ? https : http;
+
+    return new Promise((resolve, reject) => {
+        const request = requestModule.request(targetUrl, {
+            method,
+            headers,
+        }, (response) => {
+            const statusCode = response.statusCode || 500;
+            const location = response.headers.location;
+
+            if (statusCode >= 300 && statusCode < 400 && location) {
+                response.resume();
+                if (depth >= 5) {
+                    reject(new Error(`Too many redirects while fetching ${targetUrl}`));
+                    return;
+                }
+                const nextUrl = new URL(location, targetUrl).href;
+                requestUpstream(nextUrl, headers, depth + 1, method).then(resolve).catch(reject);
+                return;
+            }
+
+            resolve({
+                statusCode,
+                headers: response.headers,
+                stream: response,
+                finalUrl: targetUrl,
+            });
+        });
+
+        request.on('error', reject);
+        request.setTimeout(120000, () => {
+            request.destroy(new Error(`Upstream request timeout for ${targetUrl}`));
+        });
+        request.end();
+    });
+};
+
+const streamToString = async (stream) => {
+    const chunks = [];
+    for await (const chunk of stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks).toString('utf8');
+};
+
+const normalizeTargetUrl = (value) => {
+    const rawValue = String(value || '').trim().replace(/^"(.*)"$/, '$1');
+    if (!rawValue) return '';
+
+    const candidates = [rawValue];
+    try {
+        const decodedOnce = decodeURIComponent(rawValue);
+        if (decodedOnce && decodedOnce !== rawValue) {
+            candidates.push(decodedOnce.trim());
+        }
+    } catch {
+        // Ignore decode errors and fall back to the original value.
+    }
+
+    for (const candidate of candidates) {
+        if (/^https?:\/\//i.test(candidate)) {
+            return candidate;
+        }
+    }
+
+    return rawValue;
+};
+
+const handleMediaProxy = async (req, res) => {
     try {
         const token = String(req.query.token || '').trim();
-        const targetUrl = String(req.query.url || '').trim();
+        const targetUrl = normalizeTargetUrl(req.query.url);
+        const isHeadRequest = req.method === 'HEAD';
 
         if (!token) {
             return res.status(401).json({ message: 'Media token is required.' });
@@ -92,45 +305,73 @@ router.get('/media-proxy', async (req, res) => {
             return res.status(401).json({ message: 'Invalid media token.' });
         }
 
-        const response = await fetch(targetUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-            },
-            redirect: 'follow',
-        });
+        const requestHeaderHints = getRequestHeaderHints(req, targetUrl);
+        const response = await requestUpstream(targetUrl, buildUpstreamHeaders(req), 0, isHeadRequest ? 'HEAD' : 'GET');
 
-        const contentType = response.headers.get('content-type') || '';
+        const contentType = String(response.headers['content-type'] || '');
         const isPlaylistLike = /mpegurl|m3u8|text\/plain|xml|dash/i.test(contentType) || /\.(m3u8|mpd)(\?|$)/i.test(targetUrl);
 
         if (isPlaylistLike) {
-            const body = await response.text();
+            const body = isHeadRequest ? '' : await streamToString(response.stream);
             const rewritten = /\.mpd(\?|$)/i.test(targetUrl) || /xml|dash/i.test(contentType)
-                ? rewriteProxyMediaBody(body, token, targetUrl)
-                : rewriteProxyPlaylistBody(body, token, targetUrl);
+                ? rewriteProxyMediaBody(body, token, targetUrl, requestHeaderHints)
+                : rewriteProxyPlaylistBody(body, token, targetUrl, requestHeaderHints);
             res.setHeader('Content-Type', /\.(mpd)(\?|$)/i.test(targetUrl) || /xml|dash/i.test(contentType)
                 ? 'application/dash+xml; charset=utf-8'
                 : 'application/vnd.apple.mpegurl; charset=utf-8');
             res.setHeader('Cache-Control', 'no-store');
+            res.status(response.statusCode);
+            if (isHeadRequest) {
+                return res.end();
+            }
             return res.send(rewritten);
         }
 
-        const arrayBuffer = await response.arrayBuffer();
-        res.status(response.status);
+        res.status(response.statusCode);
         res.setHeader('Content-Type', contentType || 'application/octet-stream');
         res.setHeader('Cache-Control', 'no-store');
-        return res.send(Buffer.from(arrayBuffer));
+        const contentLength = response.headers['content-length'];
+        if (contentLength) {
+            res.setHeader('Content-Length', contentLength);
+        }
+        const upstreamRange = response.headers['content-range'];
+        if (upstreamRange) {
+            res.setHeader('Content-Range', upstreamRange);
+        }
+
+        if (isHeadRequest) {
+            if (response.stream) {
+                response.stream.resume();
+            }
+            return res.end();
+        }
+
+        if (!response.stream) {
+            return res.end();
+        }
+
+        response.stream.on('error', (streamError) => {
+            console.error('[Public Media Proxy] Stream error:', streamError);
+            if (!res.headersSent) {
+                res.status(502);
+            }
+            res.end();
+        });
+        return response.stream.pipe(res);
     } catch (error) {
         console.error('[Public Media Proxy] Failed:', error);
         if (String(error?.name || '') === 'TokenExpiredError') {
             return res.status(401).json({ message: 'Media token expired.' });
         }
+        if (String(error?.cause?.code || error?.code || '') === 'ECONNRESET') {
+            return res.status(502).json({ message: 'Upstream stream connection was reset.' });
+        }
         return res.status(500).json({ message: error.message || 'Failed to proxy media.' });
     }
-});
+};
+
+router.get('/media-proxy', handleMediaProxy);
+router.head('/media-proxy', handleMediaProxy);
 
 // Simpan OTP sementara di memori. Untuk produksi, gunakan Redis atau tabel database.
 const otpStore = {};
